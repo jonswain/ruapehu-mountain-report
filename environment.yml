@@ -1,0 +1,12 @@
+name: ruapehu-conditions-bot
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.12
+  - requests
+  - beautifulsoup4
+  - python-dotenv
+  - pip
+  - pip:
+      - google-genai

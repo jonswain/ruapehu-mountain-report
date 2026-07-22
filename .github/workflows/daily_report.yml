@@ -1,0 +1,36 @@
+name: Daily Tongariro Mountain Report
+
+on:
+  schedule:
+    # 18:00 UTC = 06:00 NZST (NZ winter, UTC+12).
+    # Note: during NZ daylight saving (NZDT, UTC+13, roughly late Sep - early
+    # Apr) this instead fires at 07:00 NZDT. Adjust the cron expression if you
+    # need a fixed local time year-round.
+    - cron: '0 18 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  send-report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run daily report
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: python main.py
