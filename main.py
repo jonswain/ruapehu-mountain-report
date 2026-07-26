@@ -530,45 +530,75 @@ def synthesize_report(data: dict) -> str:
         f"Raw source data as JSON:\n{json.dumps(data, indent=2, default=str)}"
     )
 
+    logger.info(
+        "Requesting report synthesis from Gemini (model=%s, max_output_tokens=%d, thinking_budget=%d)",
+        config.GEMINI_MODEL, config.GEMINI_MAX_OUTPUT_TOKENS, config.GEMINI_THINKING_BUDGET,
+    )
     response = client.models.generate_content(
         model=config.GEMINI_MODEL,
         contents=user_content,
         config=types.GenerateContentConfig(
             system_instruction=system_prompt,
             temperature=0.4,
-            max_output_tokens=4096,
+            max_output_tokens=config.GEMINI_MAX_OUTPUT_TOKENS,
+            thinking_config=types.ThinkingConfig(thinking_budget=config.GEMINI_THINKING_BUDGET),
         ),
     )
+
+    finish_reason = None
+    candidates = getattr(response, "candidates", None) or []
+    if candidates:
+        finish_reason = getattr(candidates[0], "finish_reason", None)
+
+    usage = getattr(response, "usage_metadata", None)
+    logger.info(
+        "Gemini response received: finish_reason=%s, prompt_tokens=%s, thoughts_tokens=%s, "
+        "output_tokens=%s, total_tokens=%s",
+        finish_reason,
+        getattr(usage, "prompt_token_count", None),
+        getattr(usage, "thoughts_token_count", None),
+        getattr(usage, "candidates_token_count", None),
+        getattr(usage, "total_token_count", None),
+    )
+    if finish_reason is not None and str(finish_reason) != "FinishReason.STOP":
+        logger.warning(
+            "Gemini finished with reason %s instead of STOP - the report may be truncated or incomplete",
+            finish_reason,
+        )
 
     text = (getattr(response, "text", None) or "").strip()
     if not text:
         raise RuntimeError("Gemini returned an empty response")
 
+    logger.info("Gemini report text length: %d chars", len(text))
     return text
 
 
-def _truncate_preserving_footer(text: str, limit: int) -> str:
+def _split_into_chunks(text: str, limit: int) -> list[str]:
     """
-    Hard-truncate to fit a length limit, but never cut into the footer
-    (source status + mandatory safety disclaimer) - trim the body instead,
-    since the disclaimer must always reach readers intact.
+    Split text into <=limit-char chunks for posting as multiple Discord
+    messages, breaking at clean paragraph/line boundaries where possible so
+    no chunk cuts off mid-sentence. Used instead of hard-truncating, so a
+    report that's genuinely too long for one embed still reaches readers in
+    full across multiple posts.
     """
-    ellipsis = "\n...[truncated]\n\n"
-    footer_idx = text.rfind("Sources:")
-    if footer_idx == -1:
-        return text[: limit - len(ellipsis)].rstrip() + ellipsis.strip()
+    if len(text) <= limit:
+        return [text]
 
-    footer = text[footer_idx:]
-    body = text[:footer_idx].rstrip()
-    available_for_body = limit - len(footer) - len(ellipsis)
-
-    if available_for_body < 200:
-        # Footer alone is unexpectedly huge relative to the limit; fall
-        # back to a plain hard truncation rather than producing an empty
-        # or negative-length body slice.
-        return text[: limit - len(ellipsis)].rstrip() + ellipsis.strip()
-
-    return body[:available_for_body].rstrip() + ellipsis + footer
+    chunks = []
+    remaining = text
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        split_at = window.rfind("\n\n")
+        if split_at < limit // 2:  # no good paragraph break; fall back to a line break
+            split_at = window.rfind("\n")
+        if split_at < limit // 2:  # still nothing reasonable; hard split
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    if remaining:
+        chunks.append(remaining)
+    return chunks
 
 
 def _split_title_and_body(report_text: str) -> tuple[str, str]:
@@ -608,35 +638,60 @@ def _embed_color_for(data: dict) -> int:
     return _DEFAULT_EMBED_COLOR
 
 
-def build_report_embed(report_text: str, data: dict) -> dict:
+def build_report_embeds(report_text: str, data: dict) -> list[dict]:
     """
-    Turn the LLM's Markdown report into a single Discord embed. Embeds
+    Turn the LLM's Markdown report into one or more Discord embeds. Embeds
     allow up to 4096 characters in the description field (vs. 2000 for a
-    plain message), so this is what actually fits the whole report without
-    truncation on a typical day.
+    plain message), so a single embed fits the whole report on a typical
+    day. If the body still exceeds that limit, split it across multiple
+    embeds (sent as separate posts) rather than truncating, so every part
+    of the report - including the safety-critical footer - always reaches
+    readers.
     """
     title, body = _split_title_and_body(report_text)
+    logger.info("Report body length: %d chars (embed limit %d)", len(body), config.EMBED_DESCRIPTION_CHAR_LIMIT)
 
-    if len(body) > config.EMBED_DESCRIPTION_CHAR_LIMIT:
-        logger.warning("Report body exceeded embed description limit (%d chars); truncating", len(body))
-        body = _truncate_preserving_footer(body, config.EMBED_DESCRIPTION_CHAR_LIMIT)
+    chunks = _split_into_chunks(body, config.EMBED_DESCRIPTION_CHAR_LIMIT)
+    if len(chunks) > 1:
+        logger.warning(
+            "Report body exceeded embed description limit; splitting into %d posts", len(chunks)
+        )
 
-    return {
-        "title": title[: config.EMBED_TITLE_CHAR_LIMIT],
-        "description": body,
-        "color": _embed_color_for(data),
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-    }
+    color = _embed_color_for(data)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    embeds = []
+    for i, chunk in enumerate(chunks):
+        chunk_title = title if i == 0 else f"{title} (continued {i + 1}/{len(chunks)})"
+        embeds.append(
+            {
+                "title": chunk_title[: config.EMBED_TITLE_CHAR_LIMIT],
+                "description": chunk,
+                "color": color,
+                "timestamp": timestamp,
+            }
+        )
+    return embeds
 
 
 # --------------------------------------------------------------------------
 # Discord publishing
 # --------------------------------------------------------------------------
 
-def send_report_embed(embed: dict) -> None:
+def send_report_embeds(embeds: list[dict]) -> None:
+    """
+    Post each embed as its own Discord message. Sent as separate requests
+    (rather than bundled into one message's "embeds" array) because Discord
+    caps the combined title+description+footer length across all embeds in
+    a single message at 6000 chars - two near-4096-char embeds would blow
+    past that if bundled together.
+    """
     webhook_url = _require_env(config.DISCORD_WEBHOOK_URL_ENV)
-    resp = requests.post(webhook_url, json={"embeds": [embed]}, timeout=config.REQUEST_TIMEOUT_SECONDS)
-    resp.raise_for_status()
+    for i, embed in enumerate(embeds):
+        logger.info(
+            "Posting report part %d/%d to Discord (%d chars)", i + 1, len(embeds), len(embed["description"])
+        )
+        resp = requests.post(webhook_url, json={"embeds": [embed]}, timeout=config.REQUEST_TIMEOUT_SECONDS)
+        resp.raise_for_status()
 
 
 def send_alert(message: str) -> None:
@@ -673,8 +728,13 @@ def gather_data() -> dict:
     }
 
     for key, result in data.items():
-        if isinstance(result, dict) and result.get("status") == "FAILED":
+        if not isinstance(result, dict) or "status" not in result:
+            continue
+        status = result.get("status")
+        if status == "FAILED":
             logger.warning("Source '%s' failed: %s", key, result.get("error"))
+        else:
+            logger.info("Source '%s' status: %s", key, status)
 
     return data
 
@@ -706,7 +766,7 @@ def main() -> int:
 
     try:
         report = synthesize_report(data)
-        embed = build_report_embed(report, data)
+        embeds = build_report_embeds(report, data)
     except Exception:
         logger.exception("Gemini synthesis failed")
         try:
@@ -721,12 +781,13 @@ def main() -> int:
         return 1
 
     try:
-        send_report_embed(embed)
+        send_report_embeds(embeds)
     except Exception:
         logger.exception("Discord publish failed")
         return 1
 
-    logger.info("Report sent successfully (%d chars)", len(embed["description"]))
+    total_chars = sum(len(e["description"]) for e in embeds)
+    logger.info("Report sent successfully (%d parts, %d total chars)", len(embeds), total_chars)
     return 0
 
 

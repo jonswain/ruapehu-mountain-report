@@ -95,6 +95,23 @@ MAX_SCRAPE_TEXT_CHARS = 6000
 # but verify with `client.models.list()` that your key can access it first.
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 
+# gemini-flash-latest currently resolves to gemini-3.6-flash (confirmed via
+# response.model_version), which - unlike older Flash models - mandates an
+# internal "thinking" pass and rejects thinking_budget=0 outright (400
+# INVALID_ARGUMENT). That thinking spend comes out of the same
+# max_output_tokens budget as the visible report text, and is invisible in
+# response.text - so a run can silently hit MAX_TOKENS mid-thought and
+# return a truncated report with no exception raised. This is what
+# happened: 4096 tokens was tight enough for the report alone, let alone
+# report + a variable, sometimes large, thinking spend. Fix: cap thinking
+# to a bounded budget and give max_output_tokens generous headroom above
+# our ~3600-char (roughly ~1000-1200 token) target report so thinking can
+# never crowd out the visible text. See synthesize_report()'s post-call
+# logging of finish_reason / thoughts_token_count, which is what surfaces
+# this if it recurs on a future model version.
+GEMINI_THINKING_BUDGET = 1024
+GEMINI_MAX_OUTPUT_TOKENS = 8192
+
 # We publish the report as a single Discord embed (not plain message
 # "content"), since embeds allow far more text: a "description" field can
 # hold up to 4096 characters, vs. only 2000 for a normal message. The
