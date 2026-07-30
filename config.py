@@ -1,5 +1,4 @@
-"""
-Central configuration for the Tongariro Mountain Report bot.
+"""Central configuration for the Tongariro Mountain Report bot.
 
 All URLs, headers, and tunable constants live here so main.py stays
 focused on fetch/synthesize/publish logic.
@@ -24,8 +23,11 @@ AVALANCHE_API_URL = "https://www.avalanche.net.nz/api/forecast/tongariro"
 # Mt Ruapehu summit area coordinates (Dome Shelter / crater rim vicinity)
 LATITUDE = -39.28
 LONGITUDE = 175.56
+
+# "complete" (not "compact") because we need ultraviolet_index_clear_sky for
+# the report's UV index section - the compact product omits that field.
 YR_NO_API_URL = (
-    f"https://api.met.no/weatherapi/locationforecast/2.0/compact"
+    f"https://api.met.no/weatherapi/locationforecast/2.0/complete"
     f"?lat={LATITUDE}&lon={LONGITUDE}"
 )
 
@@ -123,7 +125,9 @@ GEMINI_MAX_OUTPUT_TOKENS = 8192
 # under 256 chars leaves that nowhere near binding here.
 EMBED_TITLE_CHAR_LIMIT = 256
 EMBED_DESCRIPTION_CHAR_LIMIT = 4096
-TARGET_REPORT_CHAR_LIMIT = 3600  # target for the LLM; comfortable margin under 4096 to absorb overshoot
+TARGET_REPORT_CHAR_LIMIT = (
+    3600  # target for the LLM; comfortable margin under 4096 to absorb overshoot
+)
 
 # --------------------------------------------------------------------------
 # Environment variables (loaded via python-dotenv in main.py)

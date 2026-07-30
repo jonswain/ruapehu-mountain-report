@@ -149,6 +149,7 @@ def fetch_yr_no() -> dict:
                     "wind_from_direction_deg": details.get("wind_from_direction"),
                     "relative_humidity_pct": details.get("relative_humidity"),
                     "cloud_area_fraction_pct": details.get("cloud_area_fraction"),
+                    "uv_index_clear_sky": details.get("ultraviolet_index_clear_sky"),
                     "symbol_code": next_1h.get("summary", {}).get("symbol_code"),
                     "precipitation_mm_next_hour": next_1h.get("details", {}).get("precipitation_amount"),
                 }
@@ -189,6 +190,54 @@ def _strip_html(html_fragment: str | None) -> str:
     if not html_fragment:
         return ""
     return " ".join(BeautifulSoup(html_fragment, "html.parser").get_text(separator=" ").split())
+
+
+# Clockwise compass order, matching avalanche.net.nz's aspect-rose diagram.
+_COMPASS_ORDER = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+
+
+def _format_aspect_arcs(active_aspects: set[str]) -> str:
+    """
+    Render a set of affected 8-point compass aspects as human-readable arc(s),
+    e.g. {"N", "NE", "E", "SE", "S", "SW"} -> "N to SW (through E)", matching
+    the wording avalanche.net.nz uses under its compass-rose diagrams.
+
+    Handles wrap-around (e.g. an arc spanning W/NW/N) and multiple disjoint
+    arcs (joined with "; "), though a single arc is by far the common case.
+    """
+    if not active_aspects:
+        return "not specified"
+
+    n = len(_COMPASS_ORDER)
+    indices = {_COMPASS_ORDER.index(a) for a in active_aspects}
+    if len(indices) == n:
+        return "all aspects"
+
+    runs: list[list[int]] = []
+    visited: set[int] = set()
+    for start in indices:
+        if start in visited or (start - 1) % n in indices:
+            continue  # not the start of a run - it has a predecessor in the set
+        run = [start]
+        visited.add(start)
+        cur = start
+        while (cur + 1) % n in indices and (cur + 1) % n not in visited:
+            cur = (cur + 1) % n
+            run.append(cur)
+            visited.add(cur)
+        runs.append(run)
+
+    parts = []
+    for run in sorted(runs, key=lambda r: r[0]):
+        names = [_COMPASS_ORDER[i] for i in run]
+        if len(names) == 1:
+            parts.append(names[0])
+        elif len(names) == 2:
+            parts.append(f"{names[0]} to {names[-1]}")
+        else:
+            mid = names[(len(names) - 1) // 2]
+            parts.append(f"{names[0]} to {names[-1]} (through {mid})")
+    return "; ".join(parts)
 
 
 def _elevation_band_key(altitude_from, altitude_to) -> str:
@@ -244,15 +293,15 @@ def _parse_avalanche_api_payload(payload: dict) -> dict:
 
     problems = []
     for danger in sorted(forecast.get("avalancheDangers", []), key=lambda d: d.get("priority_level", 99)):
+        # NOTE: the API's aspect booleans are always 0/false in practice
+        # (confirmed across 26 historical forecasts) - the actual signal is
+        # which aspect *keys are present* per elevation band, not their
+        # value. Presence of a key means that aspect is affected for this
+        # problem; the boolean appears to be an unused/vestigial field.
         aspects_raw = danger.get("aspects", {}) or {}
-        active_aspects = sorted(
-            {
-                aspect.upper()
-                for band_aspects in aspects_raw.values()
-                for aspect, is_active in band_aspects.items()
-                if is_active
-            }
-        )
+        active_aspects = {
+            aspect.upper() for band_aspects in aspects_raw.values() for aspect in band_aspects
+        }
         problems.append(
             {
                 "priority": danger.get("priority"),
@@ -261,7 +310,7 @@ def _parse_avalanche_api_payload(payload: dict) -> dict:
                 "size_of_5": danger.get("size"),
                 "trend": danger.get("trend"),
                 "time_of_day": danger.get("time"),
-                "aspects_affected": active_aspects or "not specified",
+                "aspects_affected": _format_aspect_arcs(active_aspects),
                 "description": _strip_html(danger.get("description")),
             }
         )
@@ -473,6 +522,12 @@ Produce the report with EXACTLY these sections, in this order:
 
 3. `### ☀️ Weather & Sun Overview`
    - Sunrise / sunset times
+   - UV index through the day, from Yr.no's `uv_index_clear_sky` hourly
+     field: report morning (~9am), midday (~12-1pm), and afternoon (~3-4pm)
+     values (pick the closest available hourly timestamp to each). Note
+     this is a clear-sky estimate, and mention the exposure risk in plain
+     terms (e.g. snow glare increases effective UV exposure) if the values
+     are moderate or higher.
    - A short note on intraday trends (e.g. temperature drops, freezing
      level changes, wind increasing) based only on what the data shows
    - A compact Markdown table (inside a fenced code block) comparing
