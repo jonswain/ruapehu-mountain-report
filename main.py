@@ -41,7 +41,15 @@ import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types
+from tenacity import (
+    before_sleep_log,
+    retry,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential,
+)
 
 import config
 
@@ -465,6 +473,32 @@ def fetch_mountain_forecast() -> dict:
 # Gemini synthesis
 # --------------------------------------------------------------------------
 
+
+def _is_retryable_gemini_error(exc: BaseException) -> bool:
+    """
+    5xx (ServerError) covers transient overload/unavailability; 429
+    (ClientError with code 429) covers rate limiting. Other 4xx errors
+    (bad API key, invalid request, etc.) are not retryable - retrying
+    won't fix them.
+    """
+    if isinstance(exc, genai_errors.ServerError):
+        return True
+    if isinstance(exc, genai_errors.ClientError):
+        return exc.code == 429
+    return False
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable_gemini_error),
+    stop=stop_after_attempt(config.GEMINI_RETRY_ATTEMPTS),
+    wait=wait_exponential(multiplier=10, min=10, max=90),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _generate_content_with_retry(client: genai.Client, **kwargs):
+    return client.models.generate_content(**kwargs)
+
+
 SYSTEM_PROMPT_TEMPLATE = """\
 You are an expert backcountry mountain conditions editor writing a daily
 report for Mt. Ruapehu and the Tongariro region of New Zealand, for an
@@ -589,7 +623,8 @@ def synthesize_report(data: dict) -> str:
         "Requesting report synthesis from Gemini (model=%s, max_output_tokens=%d, thinking_budget=%d)",
         config.GEMINI_MODEL, config.GEMINI_MAX_OUTPUT_TOKENS, config.GEMINI_THINKING_BUDGET,
     )
-    response = client.models.generate_content(
+    response = _generate_content_with_retry(
+        client,
         model=config.GEMINI_MODEL,
         contents=user_content,
         config=types.GenerateContentConfig(
@@ -756,6 +791,23 @@ def send_alert(message: str) -> None:
     resp.raise_for_status()
 
 
+def _alerts_suppressed() -> bool:
+    """
+    Set by the GitHub Actions workflow while it's still retrying a failed
+    run, so a transient failure doesn't post a Discord alert on every
+    attempt - only once, if all retries are exhausted (see
+    daily_report.yml's "Alert on repeated failure" step).
+    """
+    return os.environ.get("SUPPRESS_DISCORD_ALERT", "").strip().lower() in ("1", "true", "yes")
+
+
+def _send_alert_unless_suppressed(message: str) -> None:
+    if _alerts_suppressed():
+        logger.info("Discord alert suppressed (workflow is still retrying): %s", message)
+        return
+    send_alert(message)
+
+
 def _require_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -808,7 +860,7 @@ def main() -> int:
     if all_failed:
         logger.error("All data sources failed; sending an alert instead of a full report")
         try:
-            send_alert(
+            _send_alert_unless_suppressed(
                 "⚠️ **Tongariro Mountain Report failed to generate today.**\n"
                 "All upstream data sources (Yr.no, Avalanche NZ, "
                 "Mountain-Forecast) failed to fetch. Please check "
@@ -825,7 +877,7 @@ def main() -> int:
     except Exception:
         logger.exception("Gemini synthesis failed")
         try:
-            send_alert(
+            _send_alert_unless_suppressed(
                 "⚠️ **Tongariro Mountain Report failed to generate today.**\n"
                 "Data was fetched but report synthesis failed. Please check "
                 "avalanche.net.nz directly, and check the bot logs.\n"

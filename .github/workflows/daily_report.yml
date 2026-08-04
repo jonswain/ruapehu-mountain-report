@@ -15,7 +15,9 @@ permissions:
 jobs:
   send-report:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Worst case: 4 attempts x up to 8 min each, plus 3 waits of 30 min
+    # between failed attempts (~32 + 90 min), plus setup steps.
+    timeout-minutes: 140
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
@@ -29,8 +31,37 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # main.py already retries individual Gemini API calls a few times
+      # with a short backoff (see GEMINI_RETRY_ATTEMPTS in config.py), for
+      # quick blips. This outer retry is the safety net for longer outages
+      # (e.g. sustained high load / usage limits) that don't clear in
+      # seconds: it re-runs the whole script - re-fetching sources and
+      # re-querying Gemini - up to 4 times, 30 minutes apart.
+      # SUPPRESS_DISCORD_ALERT stops main.py posting its own failure alert
+      # on each retried attempt; only a final, all-retries-exhausted
+      # failure is reported, by the step below.
       - name: Run daily report
+        id: run_report
+        uses: nick-fields/retry@v3
+        with:
+          timeout_minutes: 8
+          max_attempts: 4
+          retry_wait_seconds: 1800
+          retry_on: any
+          command: python main.py
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-        run: python main.py
+          SUPPRESS_DISCORD_ALERT: 'true'
+
+      - name: Alert on repeated failure
+        if: failure()
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          TOTAL_ATTEMPTS: ${{ steps.run_report.outputs.total_attempts }}
+        run: |
+          message="⚠️ **Tongariro Mountain Report failed after ${TOTAL_ATTEMPTS:-several} attempts.**
+          Please check avalanche.net.nz directly, and check the bot logs.
+          -# 🤖 Automated alert from the mountain report bot."
+          payload=$(jq -n --arg content "$message" '{content: $content}')
+          curl -sf -X POST -H "Content-Type: application/json" -d "$payload" "$DISCORD_WEBHOOK_URL"

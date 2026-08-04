@@ -114,6 +114,13 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
 GEMINI_THINKING_BUDGET = 1024
 GEMINI_MAX_OUTPUT_TOKENS = 8192
 
+# Attempts (including the first) for transient Gemini errors - 5xx server
+# overload or 429 rate limiting - with exponential backoff between them.
+# This rides out short blips within the same job run. Longer outages (e.g.
+# a sustained capacity issue or quota reset) are handled one layer up, by
+# the GitHub Actions workflow retrying the whole step ~30 minutes apart.
+GEMINI_RETRY_ATTEMPTS = int(os.getenv("GEMINI_RETRY_ATTEMPTS", "3"))
+
 # We publish the report as a single Discord embed (not plain message
 # "content"), since embeds allow far more text: a "description" field can
 # hold up to 4096 characters, vs. only 2000 for a normal message. The
