@@ -2,11 +2,13 @@ name: Daily Tongariro Mountain Report
 
 on:
   schedule:
-    # 18:00 UTC = 06:00 NZST (NZ winter, UTC+12).
+    # 18:07 UTC = ~06:07 NZST (NZ winter, UTC+12). Offset a few minutes off
+    # the hour since GitHub Actions deprioritizes on-the-hour schedules
+    # under load, making them more likely to be delayed or skipped.
     # Note: during NZ daylight saving (NZDT, UTC+13, roughly late Sep - early
-    # Apr) this instead fires at 07:00 NZDT. Adjust the cron expression if you
+    # Apr) this instead fires at 07:07 NZDT. Adjust the cron expression if you
     # need a fixed local time year-round.
-    - cron: '0 18 * * *'
+    - cron: '7 18 * * *'
   workflow_dispatch: {}
 
 permissions:
