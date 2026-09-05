@@ -2,14 +2,24 @@ name: Daily Tongariro Mountain Report
 
 on:
   schedule:
-    # 12:37 UTC = 00:37 NZST (NZ winter, UTC+12), i.e. just after midnight.
+    # Scheduled for 08:37 UTC = 20:37 NZST (NZ winter, UTC+12) the previous
+    # day. This looks early, but GitHub Actions has been consistently
+    # starting this job ~4 hours late (observed: scheduled 12:37 UTC, actual
+    # runs 16:34-16:53 UTC), likely due to `schedule` triggers being
+    # deprioritized under load - worse for low-activity repos, and worse
+    # around this time since 12:37 UTC lands mid-morning US Eastern, a peak
+    # period. Scheduling 4 hours earlier compensates, so the job actually
+    # runs around 00:37 NZST (just after midnight) as originally intended.
+    # If GitHub's delay pattern changes, re-check actual run times
+    # (`gh run list --workflow=daily_report.yml`) and adjust.
     # Offset a few minutes off the hour since GitHub Actions deprioritizes
     # on-the-hour schedules under load, making them more likely to be delayed
     # or skipped.
     # Note: during NZ daylight saving (NZDT, UTC+13, roughly late Sep - early
-    # Apr) this instead fires at 01:37 NZDT. Adjust the cron expression if you
-    # need a fixed local time year-round.
-    - cron: '37 12 * * *'
+    # Apr) this instead fires (before the delay) at 21:37 NZDT the previous
+    # day. Adjust the cron expression if you need a fixed local time
+    # year-round.
+    - cron: '37 8 * * *'
   workflow_dispatch: {}
 
 permissions:
